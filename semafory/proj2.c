@@ -3,6 +3,7 @@
 #include <stdbool.h>
 
 #include <semaphore.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -39,7 +40,7 @@ typedef struct Shared {
     int oxygen;
     int curr_h;
     int curr_o;
-    int next;       // if 1 no more
+    int nonext;       // if 1 no more
     size_t num_rows;
     int molNo;
     FILE* output_f ;
@@ -54,7 +55,7 @@ int arg_process(int argc, char** argv, shared_t* in)
     if(argc != 5)
     {
         fprintf(stderr,"ERROR: incorrect number of arguments\n");
-        exit(EXIT_FAILURE);
+        return 1;
     }
     char* end;
 
@@ -62,32 +63,40 @@ int arg_process(int argc, char** argv, shared_t* in)
     if (*end != '\0' || in->no < 0)
     {
         fprintf(stderr,"ERROR: incorrect arguments\n");
-        exit(EXIT_FAILURE);
+        return 1;
     }
 
     in->nh = (int)strtol(argv[2], &end, 0);
-    if (*end != '\0' || in->no < 0)
+    if (*end != '\0' || in->nh < 0)
     {
         fprintf(stderr,"ERROR: incorrect arguments\n");
-        exit(EXIT_FAILURE);
+        return 1;
     }
 
     in->ti = (int)strtol(argv[3], &end, 0);
     if (*end != '\0' || in->ti < 0 || in->ti > 1000)
     {
         fprintf(stderr,"ERROR: incorrect arguments\n");
-        exit(EXIT_FAILURE);
+        return 1;
     }
 
     in->tb = (int)strtol(argv[4], &end, 0);
     if (*end != '\0' || in->tb < 0 || in->tb > 1000)
     {
         fprintf(stderr,"ERROR: incorrect arguments\n");
-        exit(EXIT_FAILURE);
+        return 1;
     }
     return 0;
 }
 
+//unmapping memory 
+void myunmap(shared_t* shared)
+{
+    if (munmap(shared, sizeof(shared_t)) == -1) // unmap shared emmory 
+        fprintf(stderr, "ERROR: unable to clean shared memory.\n");
+}
+
+//function for printing to the file 
 // action:  1 started
 //          2 going to queue
 //          3 creating molecule 
@@ -125,8 +134,10 @@ void my_print(shared_t* shared, char atom, int id, int action)
     sem_post(&shared->output);
 }
 
+// function to wait random time between 0 and argument of the function 
 void rand_wait(int max_time)
 {
+    srand(time(0));
     usleep((rand()%(max_time+1))*TIMECONVERT);
 }
 
@@ -139,15 +150,15 @@ void creating_mol(shared_t *shared)
     shared->curr_h -= 2;
     sem_post(&(shared->oxy));
     shared->oxygen -= 1;
-    shared->curr_o -= 2;
+    shared->curr_o -= 1;
 }
 
-// controlls if can be created more molecules of not lets atoms go through semaphores 
+// controlls if can be created more molecules if not lets procceses  go through semaphores so they dont stay locked
 void poss_next(shared_t *shared)
 {
     if (shared->curr_h < 2 || shared->curr_o < 1)
     {
-        shared->next = 1;
+        shared->nonext = 1;
         for(int i = 0; i < shared->curr_o; i++)
         {
             sem_post(&(shared->oxy));
@@ -162,6 +173,7 @@ void poss_next(shared_t *shared)
     }
 }
 
+// function lets processes wait and when n processes are waiting it lets the through
 void barrier(shared_t* shared, int n)
 {
     sem_wait(&(shared->mutex2));
@@ -188,14 +200,31 @@ void barrier(shared_t* shared, int n)
     sem_wait(&(shared->bar2));
 }
 
-
-
-
-
-
-int hydrogen(shared_t* shared, int id)
+void nonext(shared_t* shared, char atom, int id)
 {
-    int value;
+    if (atom == 'O')
+    {
+        my_print(shared, 'O', id, 6);
+        shared->curr_o--;
+        sem_post(&(shared->mutex));
+        sem_post(&(shared->hyd));
+        sem_post(&(shared->oxy));
+        exit(EXIT_FAILURE);
+    }
+    else if (atom == 'H')
+    {
+        my_print(shared, 'H', id, 5);
+        shared->curr_h--;
+        sem_post(&(shared->mutex));
+        sem_post(&(shared->hyd));
+        sem_post(&(shared->oxy));
+        exit(EXIT_FAILURE);
+    }
+}
+
+
+void hydrogen(shared_t* shared, int id)
+{
     //starting and going to q
     my_print(shared, 'H', id, 1);
     rand_wait(shared->ti);
@@ -205,28 +234,18 @@ int hydrogen(shared_t* shared, int id)
     //mutex
     sem_wait(&(shared->mutex));
 
-    if (shared->next)
-    {
-        puts("pomutexe hydrogen");
-        my_print(shared, 'H', id, 5);
-        shared->curr_h--;
-        sem_post(&(shared->mutex));
-        sem_post(&(shared->hyd));
-        sem_post(&(shared->oxy));
-        exit(EXIT_FAILURE);
-    }
-    /*
-    if (shared->curr_h < 2 || shared->curr_o < 1)
-    {
-        my_print(shared, 'H', id, 5);
-        shared->curr_h--;
-        sem_post(&(shared->mutex));
-        exit(EXIT_SUCCESS);
-    }
-    */
 
+    // if there is not enough atoms for mollecule prints not enough and end the process
+    if (shared->nonext)
+    {
+        nonext(shared, 'H', id);
+    }
+
+    //increse number of hydrogens waiting 
     shared->hydrogen++;
 
+    // if there is enough atoms waithing to create a mollecule start creating it 
+    // else post mutex and wait
     if (shared->hydrogen >= 2 && shared->oxygen >= 1)
     {
         creating_mol(shared);
@@ -238,33 +257,29 @@ int hydrogen(shared_t* shared, int id)
 
     sem_wait(&(shared->hyd));
 
-    if (shared->next)
+    if (shared->nonext)
     {
-        puts("neskorsejc hydrogen ");
-        my_print(shared, 'H', id, 5);
-        shared->curr_h--;
-        sem_post(&(shared->mutex));
-        sem_post(&(shared->hyd));
-        sem_post(&(shared->oxy));
-        exit(EXIT_FAILURE);
+        nonext(shared, 'H', id);
     }
-    // po tadialto som dobre////////////////////////////////  
+
    
+    //print creating mollecule 
     my_print(shared, 'H', id, 3);
 
+    // waits for all 3 atoms to get here and then lets all go through 
     barrier(shared, A_IN_MOL);
 
     my_print(shared, 'H', id, 4);
 
+    // post oxygen which is waiting for 2 so it ends later than hydrogens
     sem_post(&(shared->end));
 
-    return 0;
+    exit(EXIT_SUCCESS);
 }
 
 
-int oxygen(shared_t* shared, int id)
+void oxygen(shared_t* shared, int id)
 {
-    int value;
     //starting and going to q
     my_print(shared, 'O', id, 1);
     rand_wait(shared->ti);
@@ -273,29 +288,21 @@ int oxygen(shared_t* shared, int id)
     //mutex
     sem_wait(&(shared->mutex));
 
-    if (shared->next)
+    // 1. check if there is enough atoms left to create a mollecule 
+    poss_next(shared); 
+
+    // if there is not enough atoms for mollecule prints not enough and end the process
+    if (shared->nonext)
     {
-        puts("pomutexe oxy ");
-        my_print(shared, 'O', id, 6);
-        shared->curr_o--;
-        sem_post(&(shared->mutex));
-        sem_post(&(shared->hyd));
-        sem_post(&(shared->oxy));
-        exit(EXIT_FAILURE);
+        nonext(shared, 'O', id);
     }
 
-    /*
-    if (shared->curr_h < 2)
-    {
-        my_print(shared, 'O', id, 6);
-        shared->curr_o--;
-        sem_post(&(shared->mutex));
-        exit(EXIT_FAILURE);
-    }
-    */
-
+    //increase number of oxygens waiting
     shared->oxygen++;
 
+
+    // if there is enough atoms waithing to create a mollecule start creating it 
+    // else post mutex and wait
     if (shared->hydrogen >= 2)
     {
         creating_mol(shared);
@@ -308,18 +315,11 @@ int oxygen(shared_t* shared, int id)
 
     sem_wait(&(shared->oxy));
     
-    if (shared->next)
+    if (shared->nonext)
     {
-        puts("neskorsejc oxy ");
-        my_print(shared, 'O', id, 6);
-        shared->curr_o--;
-        sem_post(&(shared->mutex));
-        sem_post(&(shared->hyd));
-        sem_post(&(shared->oxy));
-        exit(EXIT_FAILURE);
+        nonext(shared, 'O', id);
     }
 
-    // po tadialto som dobre////////////////////////////////  
 
     my_print(shared, 'O', id, 3);
 
@@ -327,17 +327,20 @@ int oxygen(shared_t* shared, int id)
 
     barrier(shared, A_IN_MOL);
     
+    //waits for hydrogens to go first so it can post the mutex
     sem_wait(&(shared->end));
     sem_wait(&(shared->end));
 
     my_print(shared, 'O', id, 4);
 
-    poss_next(shared);
+    poss_next(shared); 
+
     sem_post(&(shared->mutex));
 
-    return 0;
+    exit(EXIT_SUCCESS);
 }
 
+// function deastroys semaphores and closes output file 
 void destroy_all(shared_t *shared)
 {
     sem_destroy(&(shared->hyd));
@@ -355,8 +358,6 @@ void destroy_all(shared_t *shared)
     sem_destroy(&(shared->output));
 
     fclose(shared->output_f);
-
-
 }
 
 
@@ -372,13 +373,11 @@ void init_sem(shared_t *shared, sem_t *sem_to_init, int pshared, unsigned int va
 }
 
 
+// initialises all semaphores and sets shared memory to start values 
 int init(shared_t* shared)
 {
     init_sem(shared, &(shared->oxy), 1, 0);
-
     init_sem(shared, &(shared->hyd), 1, 0);
-
-
     init_sem(shared, &(shared->mol), 1, 0);
 
     init_sem(shared, &(shared->mutex), 1, 1);
@@ -398,7 +397,7 @@ int init(shared_t* shared)
     shared->oxygen = 0;
     shared->molNo = 3;
     shared->count = 0;
-    shared->next = 0;
+    shared->nonext = 0;
 
     shared->curr_h = shared->nh;
     shared->curr_o = shared->no;
@@ -409,6 +408,9 @@ int init(shared_t* shared)
 
 int main(int argc, char** argv)
 {
+    time_t t;   // so the waits are random 
+    srand((unsigned) time(&t));
+
     // creation of shared memory 
     shared_t *shared = mmap(NULL, sizeof(shared_t), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, 0, 0);
     if(shared == MAP_FAILED)
@@ -417,7 +419,12 @@ int main(int argc, char** argv)
         exit(EXIT_FAILURE);
     }
 
-    arg_process(argc, argv, shared);
+
+    if (arg_process(argc, argv, shared)) //controlling arguments if failed unmap shared memory and exit 
+    {
+        myunmap(shared);
+        exit(EXIT_FAILURE);
+    }
 
     init(shared);
     pid_t pid;
@@ -427,7 +434,7 @@ int main(int argc, char** argv)
         pid = fork();
         if (pid == -1)
         {
-            fprintf(stderr, "ERROR: Chyba pri forku");
+            fprintf(stderr, "ERROR: Error while forking");
             exit(EXIT_FAILURE);
         }
         if (pid == 0)
@@ -443,7 +450,7 @@ int main(int argc, char** argv)
         pid = fork();
         if (pid == -1)
         {
-            fprintf(stderr, "ERROR: Chyba pri forku");
+            fprintf(stderr, "ERROR: Error while forking");
             exit(EXIT_FAILURE);
         }
         if (pid == 0)
@@ -453,14 +460,15 @@ int main(int argc, char** argv)
         }
     }
 
-    while(wait(NULL)>0);
+    while(wait(NULL)>0); // main process waits for all other to stop 
 
-    destroy_all(shared);
-
-    if (munmap(shared, sizeof(shared_t)) == -1)
-        fprintf(stderr, "ERROR: unable to clean shared memory.\n");
+    destroy_all(shared); // destorying semaphores 
 
 
-    return 0;
+    myunmap(shared); // unmapping shared memory 
+
+
+
+    exit(EXIT_SUCCESS);
 }
 
